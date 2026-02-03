@@ -25,7 +25,7 @@ async def test_download(id: str, secret_key: str, format: str = "pdf") -> None:
         urn = to_urn(hash)
     except WrongResolverError as e:
         print(f"✗ {e}")
-        print(f"  This CLI only handles anna URNs (urn:anna:<hash>)")
+        print("  This CLI only handles anna URNs (urn:anna:<hash>)")
         sys.exit(1)
     except InvalidUrnError as e:
         print(f"✗ {e}")
@@ -88,7 +88,7 @@ async def test_api(id: str, secret_key: str, format: str = "pdf") -> None:
 
         if response.is_success:
             data = response.json()
-            print(f"✓ Success")
+            print("✓ Success")
             print(f"  ID: {data['id']}")
             print(f"  Hash: {data['hash']}")
             print(f"  Format: {data['format']}")
@@ -144,6 +144,7 @@ Examples:
         if not secret_key:
             print("Error: --key or ANNAS_DL_ANNAS_SECRET_KEY required")
             sys.exit(1)
+        assert secret_key is not None  # narrowed by check above
         asyncio.run(test_download(args.id, secret_key, args.format))
 
     elif args.command == "api":
@@ -153,6 +154,7 @@ Examples:
         if not secret_key:
             print("Error: --key or ANNAS_DL_ANNAS_SECRET_KEY required")
             sys.exit(1)
+        assert secret_key is not None  # narrowed by check above
         asyncio.run(test_api(args.id, secret_key, args.format))
 
 
