@@ -16,14 +16,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def build_key(hash: str, format: str) -> str:
+# Default prefixes (can be overridden via Settings)
+DEFAULT_RAW_PREFIX = "raw/annas"
+DEFAULT_META_PREFIX = "meta/annas"
+
+
+def build_key(hash: str, format: str, prefix: str = DEFAULT_RAW_PREFIX) -> str:
     """Build S3 key for a book file."""
-    return f"books/{hash}.{format}"
+    return f"{prefix}/{hash}.{format}"
 
 
-def build_meta_key(hash: str) -> str:
+def build_meta_key(hash: str, prefix: str = DEFAULT_META_PREFIX) -> str:
     """Build S3 key for book metadata."""
-    return f"books/{hash}.meta.json"
+    return f"{prefix}/{hash}.json"
 
 
 @dataclass
@@ -33,27 +38,41 @@ class S3Storage:
     _client: "S3Client"
     _bucket: str
     _presign_expiry: int
+    _raw_prefix: str
+    _meta_prefix: str
 
     @classmethod
     def create(cls, settings: "Settings") -> "S3Storage":
         """Create S3 storage from settings."""
+        assert settings.s3_bucket is not None, "s3_bucket is required"
+
         config = BotoConfig(
             region_name=settings.s3_region,
             signature_version="s3v4",
             retries={"max_attempts": 3, "mode": "adaptive"},
         )
 
-        client_kwargs = {"config": config}
-        if settings.s3_endpoint:
-            client_kwargs["endpoint_url"] = settings.s3_endpoint
-
-        client = boto3.client("s3", **client_kwargs)
+        client: S3Client = boto3.client(
+            "s3",
+            config=config,
+            endpoint_url=settings.s3_endpoint,
+        )
 
         return cls(
             _client=client,
             _bucket=settings.s3_bucket,
             _presign_expiry=settings.s3_presign_expiry,
+            _raw_prefix=settings.s3_raw_prefix,
+            _meta_prefix=settings.s3_meta_prefix,
         )
+
+    def book_key(self, hash: str, format: str) -> str:
+        """Build S3 key for a book file using configured prefix."""
+        return build_key(hash, format, self._raw_prefix)
+
+    def meta_key(self, hash: str) -> str:
+        """Build S3 key for metadata using configured prefix."""
+        return build_meta_key(hash, self._meta_prefix)
 
     def exists(self, key: str) -> bool:
         """Check if a key exists in S3."""

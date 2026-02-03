@@ -9,11 +9,13 @@ class Settings(BaseSettings):
     # Anna's Archive API key (optional - can be passed via X-Annas-Key header)
     annas_secret_key: str | None = None
 
-    # S3 configuration
-    s3_bucket: str
+    # S3 configuration (optional for CLI commands that don't use S3)
+    s3_bucket: str | None = None
     s3_region: str = "us-east-1"
     s3_endpoint: str | None = None
     s3_presign_expiry: int = 604800  # 7 days in seconds
+    s3_raw_prefix: str = "raw/annas"  # Path prefix for book files
+    s3_meta_prefix: str = "meta/annas"  # Path prefix for metadata files
 
     # CDN configuration
     cdn_start_index: int = 5  # Start with higher indices (0-4 often overloaded)
