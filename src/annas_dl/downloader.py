@@ -32,6 +32,10 @@ class DownloadResult:
     cdn_host: str
     duration_ms: int
     size_bytes: int
+    # Quota info from Anna's Archive API
+    downloads_left: int = 0
+    downloads_per_day: int = 0
+    downloads_done_today: int = 0
 
 
 class DownloadError(Exception):
@@ -96,9 +100,11 @@ async def download_book(
 
         # Step 1: Get download URL from API (with specific CDN index)
         try:
-            download_url = await client.get_download_url(
+            api_result = await client.get_download_url(
                 hash, secret_key, domain_index=cdn_index
             )
+            download_url = api_result.download_url
+            quota_info = (api_result.downloads_left, api_result.downloads_per_day, api_result.downloads_done_today)
         except Exception as exc:
             logger.warning(
                 "Failed to get download URL (attempt=%d, cdn_index=%d): %s",
@@ -116,7 +122,7 @@ async def download_book(
 
         # Extract CDN host for logging
         cdn_host = download_url.split("/")[2] if "/" in download_url else "unknown"
-        logger.info("Got CDN URL from %s (cdn_index=%d)", cdn_host, cdn_index)
+        logger.info("Got CDN URL from %s (cdn_index=%d, downloads_left=%d)", cdn_host, cdn_index, quota_info[0])
 
         # Step 2: Download from CDN
         try:
@@ -173,6 +179,9 @@ async def download_book(
                     cdn_host=cdn_host,
                     duration_ms=duration_ms,
                     size_bytes=len(content),
+                    downloads_left=quota_info[0],
+                    downloads_per_day=quota_info[1],
+                    downloads_done_today=quota_info[2],
                 )
 
         except httpx.TimeoutException as exc:
