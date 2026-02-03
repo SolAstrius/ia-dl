@@ -18,6 +18,8 @@ from pydantic import BaseModel
 from .annas_client import (
     AnnasClient,
     AnnasClientError,
+    BookMetadata,
+    DDoSGuardError,
     InvalidKeyError,
     NoDownloadsLeftError,
     NotMemberError,
@@ -58,9 +60,16 @@ async def lifespan(app: FastAPI):
     if not settings.s3_bucket:
         raise RuntimeError("ANNAS_DL_S3_BUCKET is required for server mode")
 
-    # Initialize Anna's Archive client
-    _annas_client = AnnasClient.create(timeout=15.0)
-    logger.info("Initialized Anna's Archive client")
+    # Initialize Anna's Archive client with FlareSolverr for DDoS-Guard bypass
+    _annas_client = AnnasClient.create(
+        timeout=15.0,
+        flaresolverr_url=settings.flaresolverr_url,
+        secret_key=settings.annas_secret_key,
+    )
+    logger.info(
+        "Initialized Anna's Archive client (flaresolverr=%s)",
+        "enabled" if settings.flaresolverr_url else "disabled",
+    )
 
     # Initialize S3 storage
     _s3_storage = S3Storage.create(settings)
@@ -178,6 +187,58 @@ class I2NResponse(BaseModel):
 
     input_urn: str
     canonical_urn: str
+
+
+class BookInfoResponse(BaseModel):
+    """Book metadata from Anna's Archive (without downloading).
+
+    Fetched directly from Anna's Archive /db/aarecord_elasticsearch/ endpoint.
+    """
+
+    urn: str
+    hash: str
+
+    # Core fields
+    title_best: str
+    author_best: str
+    publisher_best: str
+    extension_best: str
+    year_best: str
+
+    # Additional values
+    title_additional: list[str] = []
+    author_additional: list[str] = []
+    publisher_additional: list[str] = []
+
+    # Language
+    language_codes: list[str] = []
+
+    # Size
+    filesize_best: int = 0
+
+    # Content info
+    content_type_best: str = ""
+    stripped_description_best: str = ""
+
+    # Cover images
+    cover_url_best: str = ""
+    cover_url_additional: list[str] = []
+
+    # Edition
+    edition_varia_best: str = ""
+
+    # Dates
+    added_date_best: str = ""
+
+    # Identifiers
+    identifiers_unified: dict[str, list[str]] = {}
+
+    # IPFS
+    ipfs_infos: list[dict[str, str]] = []
+
+    # Availability flags
+    has_aa_downloads: int = 0
+    has_torrent_paths: int = 0
 
 
 class ErrorResponse(BaseModel):
@@ -545,6 +606,58 @@ async def resolve_i2n(id: str) -> I2NResponse:
     """
     _, canonical = _parse_and_validate_urn(id)
     return I2NResponse(input_urn=id, canonical_urn=canonical)
+
+
+@app.get("/urn/{id:path}/info", response_model=BookInfoResponse)
+async def get_book_info(id: str) -> BookInfoResponse:
+    """Get book metadata from Anna's Archive without downloading.
+
+    Fetches metadata directly from Anna's Archive /db/aarecord_elasticsearch/
+    endpoint. Does NOT download the book file - only retrieves metadata.
+
+    This is useful for:
+    - Checking if a book exists before downloading
+    - Getting cover URLs, descriptions, identifiers
+    - Building search indexes or catalogs
+    """
+    if _annas_client is None:
+        raise error_response(503, "unavailable", "Service not initialized")
+
+    hash, urn = _parse_and_validate_urn(id)
+
+    try:
+        meta = await _annas_client.fetch_metadata(hash)
+    except DDoSGuardError as exc:
+        raise error_response(502, "upstream_error", f"DDoS-Guard bypass failed: {exc}", urn=urn)
+    except RecordNotFoundError as exc:
+        raise error_response(404, "not_found", str(exc), urn=urn)
+    except AnnasClientError as exc:
+        raise error_response(502, "upstream_error", str(exc), urn=urn)
+
+    return BookInfoResponse(
+        urn=urn,
+        hash=hash,
+        title_best=meta.title_best,
+        author_best=meta.author_best,
+        publisher_best=meta.publisher_best,
+        extension_best=meta.extension_best,
+        year_best=meta.year_best,
+        title_additional=meta.title_additional,
+        author_additional=meta.author_additional,
+        publisher_additional=meta.publisher_additional,
+        language_codes=meta.language_codes,
+        filesize_best=meta.filesize_best,
+        content_type_best=meta.content_type_best,
+        stripped_description_best=meta.stripped_description_best,
+        cover_url_best=meta.cover_url_best,
+        cover_url_additional=meta.cover_url_additional,
+        edition_varia_best=meta.edition_varia_best,
+        added_date_best=meta.added_date_best,
+        identifiers_unified=meta.identifiers_unified,
+        ipfs_infos=meta.ipfs_infos,
+        has_aa_downloads=meta.has_aa_downloads,
+        has_torrent_paths=meta.has_torrent_paths,
+    )
 
 
 @app.post("/books/download", response_model=BatchDownloadResponse)

@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
 
+    # FlareSolverr for DDoS-Guard bypass
+    flaresolverr_url: str | None = None
+
     model_config = {"env_prefix": "ANNAS_DL_", "env_file": ".env", "extra": "ignore"}
 
 
