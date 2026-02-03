@@ -30,8 +30,65 @@ class BookMetadata:
     ipfs_cid: str | None = None
 
 
+@dataclass
+class FastDownloadResult:
+    """Result from fast download API including quota info."""
+
+    download_url: str
+    downloads_left: int
+    downloads_per_day: int
+    downloads_done_today: int
+
+
 class AnnasClientError(Exception):
     """Error from Anna's Archive API."""
+
+    # Known error messages from Anna's Archive API
+    # See: https://software.annas-archive.li/AnnaArchivist/annas-archive/-/raw/main/allthethings/dyn/views.py
+    ERROR_INVALID_MD5 = "Invalid md5"
+    ERROR_INVALID_KEY = "Invalid secret key"
+    ERROR_FETCH_ERROR = "Error during fetching"
+    ERROR_NOT_FOUND = "Record not found"
+    ERROR_NOT_MEMBER = "Not a member"
+    ERROR_INVALID_INDICES = "Invalid domain_index or path_index"
+    ERROR_NO_DOWNLOADS = "No downloads left"
+
+
+class NoDownloadsLeftError(AnnasClientError):
+    """Fast downloads exhausted (429)."""
+
+
+class InvalidKeyError(AnnasClientError):
+    """Invalid API secret key (401)."""
+
+
+class NotMemberError(AnnasClientError):
+    """Account is not a member (403)."""
+
+
+class RecordNotFoundError(AnnasClientError):
+    """Book not found in Anna's Archive (404)."""
+
+
+class LoginError(AnnasClientError):
+    """Failed to log in with secret key."""
+
+
+@dataclass
+class Session:
+    """Authenticated session with Anna's Archive."""
+
+    account_id: str
+    cookie_name: str
+    cookie_value: str
+
+    def as_cookie_header(self) -> str:
+        """Return cookie header value for requests."""
+        return f"{self.cookie_name}={self.cookie_value}"
+
+    def as_cookies_dict(self) -> dict[str, str]:
+        """Return cookies dict for httpx."""
+        return {self.cookie_name: self.cookie_value}
 
 
 class AnnasClient:
@@ -80,7 +137,7 @@ class AnnasClient:
 
     async def get_download_url(
         self, hash: str, secret_key: str, domain_index: int | None = None
-    ) -> str:
+    ) -> FastDownloadResult:
         """Get download URL for a book with automatic failover.
 
         Args:
@@ -89,7 +146,7 @@ class AnnasClient:
             domain_index: Optional CDN server index (0-9+)
 
         Returns:
-            Direct download URL from CDN
+            FastDownloadResult with URL and quota info
         """
         last_error: Exception | None = None
 
@@ -111,13 +168,30 @@ class AnnasClient:
                 data = response.json()
 
                 if error := data.get("error"):
+                    # Raise specific exceptions for known error types
+                    if error == AnnasClientError.ERROR_NO_DOWNLOADS:
+                        raise NoDownloadsLeftError(error)
+                    if error == AnnasClientError.ERROR_INVALID_KEY:
+                        raise InvalidKeyError(error)
+                    if error == AnnasClientError.ERROR_NOT_MEMBER:
+                        raise NotMemberError(error)
+                    if error == AnnasClientError.ERROR_NOT_FOUND:
+                        raise RecordNotFoundError(error)
+                    # Generic error for others
                     raise AnnasClientError(f"API error: {error}")
 
                 download_url = data.get("download_url")
                 if not download_url:
                     raise AnnasClientError("No download URL in response")
 
-                return download_url
+                # Extract quota info
+                quota = data.get("account_fast_download_info", {})
+                return FastDownloadResult(
+                    download_url=download_url,
+                    downloads_left=quota.get("downloads_left", 0),
+                    downloads_per_day=quota.get("downloads_per_day", 0),
+                    downloads_done_today=quota.get("downloads_done_today", 0),
+                )
 
             except Exception as exc:
                 logger.warning(
@@ -196,6 +270,91 @@ class AnnasClient:
         raise AnnasClientError(
             f"All mirrors failed: {last_error}"
         ) from last_error
+
+    async def login(self, secret_key: str) -> Session:
+        """Log in with secret key and obtain session cookie.
+
+        Posts the secret key to /account and extracts the session cookie
+        from the response. This enables access to cookie-authenticated
+        endpoints (lists, comments, account settings, etc.).
+
+        Args:
+            secret_key: Anna's Archive account secret key
+
+        Returns:
+            Session object with cookie for authenticated requests
+
+        Raises:
+            LoginError: If login fails (invalid key, network error, etc.)
+        """
+        last_error: Exception | None = None
+
+        for attempt in range(len(MIRROR_DOMAINS)):
+            domain = self.current_domain
+            url = f"{domain}/account/"
+
+            logger.debug("Login attempt %d to %s", attempt + 1, domain)
+
+            try:
+                # POST the secret key as form data
+                response = await self._http.post(
+                    url,
+                    data={"key": secret_key},
+                    timeout=self._timeout,
+                    follow_redirects=False,  # We want to capture the Set-Cookie header
+                )
+
+                # Successful login returns 302 redirect with Set-Cookie
+                if response.status_code not in (302, 303):
+                    # Check if we got an error page (200 with invalid_key message)
+                    if response.status_code == 200:
+                        raise LoginError("Invalid secret key")
+                    raise LoginError(f"Unexpected status code: {response.status_code}")
+
+                # Extract the session cookie
+                # Cookie name is typically "aa_account_id2" based on the source
+                cookie_name = None
+                cookie_value = None
+
+                for name, value in response.cookies.items():
+                    # Look for the account cookie (starts with "aa_")
+                    if name.startswith("aa_"):
+                        cookie_name = name
+                        cookie_value = value
+                        break
+
+                if not cookie_name or not cookie_value:
+                    raise LoginError("No session cookie in response")
+
+                # Extract account_id from secret_key (first 7 chars)
+                account_id = secret_key[:7]
+
+                logger.info("Login successful for account %s via %s", account_id, domain)
+
+                return Session(
+                    account_id=account_id,
+                    cookie_name=cookie_name,
+                    cookie_value=cookie_value,
+                )
+
+            except LoginError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Login failed (domain=%s, attempt=%d): %s",
+                    domain,
+                    attempt + 1,
+                    exc,
+                )
+
+                if self._is_recoverable_error(exc) and attempt < len(MIRROR_DOMAINS) - 1:
+                    self._rotate_domain()
+                    last_error = exc
+                    continue
+
+                raise LoginError(str(exc)) from exc
+
+        raise LoginError(f"All mirrors failed: {last_error}") from last_error
 
     async def close(self):
         """Close the HTTP client."""
