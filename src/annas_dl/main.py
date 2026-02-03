@@ -11,13 +11,21 @@ import time
 from contextlib import asynccontextmanager
 from functools import lru_cache
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 
-from .annas_client import AnnasClient, AnnasClientError
+from .annas_client import (
+    AnnasClient,
+    AnnasClientError,
+    InvalidKeyError,
+    NoDownloadsLeftError,
+    NotMemberError,
+    RecordNotFoundError,
+)
 from .config import Settings, get_settings
 from .downloader import DownloadError, download_book
-from .s3 import S3Storage, build_key, build_meta_key, content_type_for_format
+from .s3 import S3Storage, content_type_for_format
 from .urn import parse_urn, to_urn, WrongResolverError, InvalidUrnError
 
 # Configure logging
@@ -45,6 +53,10 @@ async def lifespan(app: FastAPI):
     global _annas_client, _s3_storage
 
     settings = get_cached_settings()
+
+    # Validate required settings for server mode
+    if not settings.s3_bucket:
+        raise RuntimeError("ANNAS_DL_S3_BUCKET is required for server mode")
 
     # Initialize Anna's Archive client
     _annas_client = AnnasClient.create(timeout=15.0)
@@ -80,6 +92,14 @@ class DownloadRequest(BaseModel):
     format: str = "pdf"
 
 
+class QuotaInfo(BaseModel):
+    """Account fast download quota information."""
+
+    downloads_left: int
+    downloads_per_day: int
+    downloads_done_today: int
+
+
 class DownloadResponse(BaseModel):
     """Response from download endpoint."""
 
@@ -92,6 +112,7 @@ class DownloadResponse(BaseModel):
     duration_ms: int
     cdn_host: str
     cached: bool
+    quota: QuotaInfo | None = None  # Only present for non-cached downloads
 
 
 class BatchDownloadRequest(BaseModel):
@@ -114,6 +135,77 @@ class HealthResponse(BaseModel):
 
     status: str
     version: str
+
+
+# =============================================================================
+# RFC 2483 Resolution Service Models
+# =============================================================================
+
+
+class I2LResponse(BaseModel):
+    """I2L: URN to URL resolution response."""
+
+    urn: str
+    url: str
+
+
+class I2LsResponse(BaseModel):
+    """I2Ls: URN to multiple URLs resolution response."""
+
+    urn: str
+    urls: list[str]
+
+
+class I2CResponse(BaseModel):
+    """I2C: URN to URC (Uniform Resource Characteristics) response.
+
+    URC provides metadata about the resource without fetching it.
+    """
+
+    urn: str
+    title: str | None = None
+    format: str | None = None
+    size_bytes: int | None = None
+    content_type: str | None = None
+    cached: bool = False
+    # Additional metadata fields
+    hash: str | None = None
+    created_at: str | None = None
+
+
+class I2NResponse(BaseModel):
+    """I2N: URN to canonical URN resolution response."""
+
+    input_urn: str
+    canonical_urn: str
+
+
+class ErrorResponse(BaseModel):
+    """RFC 2483 compliant error response.
+
+    Error categories from RFC 2483:
+    - malformed_uri: URI syntax is invalid (400)
+    - wrong_resolver: Valid URN but wrong namespace for this resolver (421)
+    - not_found: URI doesn't exist in any form (404)
+    - gone: URI existed in the past but no longer available (410)
+    - access_denied: Authentication/authorization failure (401/403)
+    - quota_exceeded: Rate limit or quota exhausted (429)
+    - upstream_error: Resolution service dependency failed (502)
+    - unavailable: Service temporarily unavailable (503)
+    """
+
+    error: str  # Error category (e.g., "not_found", "wrong_resolver")
+    detail: str  # Human-readable description
+    urn: str | None = None  # The URN that caused the error, if applicable
+
+
+# Error helper
+def error_response(status_code: int, error: str, detail: str, urn: str | None = None) -> HTTPException:
+    """Create an HTTPException with RFC 2483 compliant error body."""
+    return HTTPException(
+        status_code=status_code,
+        detail=ErrorResponse(error=error, detail=detail, urn=urn).model_dump(exclude_none=True),
+    )
 
 
 # Endpoints
@@ -145,7 +237,7 @@ async def download_book_endpoint(
         DownloadResponse with presigned URL and metadata
     """
     if _annas_client is None or _s3_storage is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+        raise error_response(503, "unavailable", "Service not initialized")
 
     # Parse URN or raw hash
     try:
@@ -153,22 +245,22 @@ async def download_book_endpoint(
         hash = parsed.hash
         urn = to_urn(hash)
     except WrongResolverError as e:
-        raise HTTPException(status_code=421, detail=str(e))  # 421 Misdirected Request
+        raise error_response(421, "wrong_resolver", str(e), urn=id)
     except InvalidUrnError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise error_response(400, "malformed_uri", str(e), urn=id)
 
     settings = get_cached_settings()
 
     # Get API key: header takes precedence over env
     secret_key = x_annas_key or settings.annas_secret_key
     if not secret_key:
-        raise HTTPException(status_code=401, detail="Missing API key (X-Annas-Key header or ANNAS_DL_ANNAS_SECRET_KEY env)")
+        raise error_response(401, "access_denied", "Missing API key (X-Annas-Key header or ANNAS_DL_ANNAS_SECRET_KEY env)", urn=urn)
 
     title = request.title if request else ""
     format_hint = request.format if request else "pdf"
 
     # Build S3 key
-    key = build_key(hash, format_hint)
+    key = _s3_storage.book_key(hash, format_hint)
 
     # Check cache first
     if _s3_storage.exists(key):
@@ -195,14 +287,31 @@ async def download_book_endpoint(
         result = await download_book(_annas_client, settings, secret_key, hash, format_hint)
     except DownloadError as exc:
         logger.error("Download failed for hash=%s: %s", hash, exc)
-        status_code = 502 if exc.last_status and exc.last_status >= 500 else 500
-        raise HTTPException(status_code=status_code, detail=str(exc))
+        # Map upstream status to appropriate RFC 2483 error category
+        if exc.last_status == 404:
+            raise error_response(404, "not_found", str(exc), urn=urn)
+        elif exc.last_status and exc.last_status >= 500:
+            raise error_response(502, "upstream_error", str(exc), urn=urn)
+        else:
+            raise error_response(500, "upstream_error", str(exc), urn=urn)
+    except NoDownloadsLeftError as exc:
+        logger.warning("Fast downloads exhausted for hash=%s: %s", hash, exc)
+        raise error_response(429, "quota_exceeded", str(exc), urn=urn)
+    except InvalidKeyError as exc:
+        logger.error("Invalid API key for hash=%s: %s", hash, exc)
+        raise error_response(401, "access_denied", str(exc), urn=urn)
+    except NotMemberError as exc:
+        logger.error("Not a member for hash=%s: %s", hash, exc)
+        raise error_response(403, "access_denied", str(exc), urn=urn)
+    except RecordNotFoundError as exc:
+        logger.warning("Book not found in Anna's Archive for hash=%s: %s", hash, exc)
+        raise error_response(404, "not_found", str(exc), urn=urn)
     except AnnasClientError as exc:
         logger.error("Anna's Archive API error for hash=%s: %s", hash, exc)
-        raise HTTPException(status_code=502, detail=str(exc))
+        raise error_response(502, "upstream_error", str(exc), urn=urn)
 
     # Upload to S3
-    actual_key = build_key(hash, result.format)
+    actual_key = _s3_storage.book_key(hash, result.format)
     content_type = content_type_for_format(result.format)
     _s3_storage.upload(actual_key, result.content, content_type)
 
@@ -215,7 +324,7 @@ async def download_book_endpoint(
         "format": result.format,
         "size_bytes": result.size_bytes,
     }
-    meta_key = build_meta_key(hash)
+    meta_key = _s3_storage.meta_key(hash)
     _s3_storage.upload(meta_key, json.dumps(metadata).encode(), "application/json")
 
     # Generate presigned URL
@@ -234,7 +343,208 @@ async def download_book_endpoint(
         duration_ms=total_duration_ms,
         cdn_host=result.cdn_host,
         cached=False,
+        quota=QuotaInfo(
+            downloads_left=result.downloads_left,
+            downloads_per_day=result.downloads_per_day,
+            downloads_done_today=result.downloads_done_today,
+        ),
     )
+
+
+# =============================================================================
+# RFC 2483 Resolution Service Endpoints
+# =============================================================================
+
+
+def _parse_and_validate_urn(id: str) -> tuple[str, str]:
+    """Parse URN and return (hash, canonical_urn). Raises HTTPException on error."""
+    try:
+        parsed = parse_urn(id)
+        return parsed.hash, to_urn(parsed.hash)
+    except WrongResolverError as e:
+        raise error_response(421, "wrong_resolver", str(e), urn=id)
+    except InvalidUrnError as e:
+        raise error_response(400, "malformed_uri", str(e), urn=id)
+
+
+async def _ensure_cached(hash: str, urn: str, format_hint: str = "pdf") -> str:
+    """Ensure resource is cached, fetching from upstream if needed. Returns actual format."""
+    if _annas_client is None or _s3_storage is None:
+        raise error_response(503, "unavailable", "Service not initialized")
+
+    # Check if already cached
+    for fmt in [format_hint, "pdf", "epub", "djvu", "mobi"]:
+        key = _s3_storage.book_key(hash, fmt)
+        if _s3_storage.exists(key):
+            return fmt
+
+    # Not cached - fetch from upstream
+    settings = get_cached_settings()
+    secret_key = settings.annas_secret_key
+    if not secret_key:
+        raise error_response(401, "access_denied", "No API key configured for upstream fetch", urn=urn)
+
+    try:
+        result = await download_book(_annas_client, settings, secret_key, hash, format_hint)
+    except RecordNotFoundError as exc:
+        raise error_response(404, "not_found", str(exc), urn=urn)
+    except NoDownloadsLeftError as exc:
+        raise error_response(429, "quota_exceeded", str(exc), urn=urn)
+    except (DownloadError, AnnasClientError) as exc:
+        raise error_response(502, "upstream_error", str(exc), urn=urn)
+
+    # Cache the result
+    import json
+    actual_key = _s3_storage.book_key(hash, result.format)
+    _s3_storage.upload(actual_key, result.content, content_type_for_format(result.format))
+
+    metadata = {"hash": hash, "format": result.format, "size_bytes": result.size_bytes}
+    _s3_storage.upload(_s3_storage.meta_key(hash), json.dumps(metadata).encode(), "application/json")
+
+    return result.format
+
+
+@app.get("/urn/{id:path}", response_model=I2LResponse)
+async def resolve_i2l(
+    id: str,
+    redirect: bool = Query(False, description="If true, return 302 redirect instead of JSON"),
+    format: str = Query("pdf", description="Preferred format"),
+) -> I2LResponse | RedirectResponse:
+    """I2L: Resolve URN to a single URL.
+
+    RFC 2483 I2L operation. Returns a URL where the resource can be accessed.
+    If not cached, fetches from Anna's Archive automatically.
+
+    Args:
+        id: URN (urn:anna:<hash>) or raw MD5 hash
+        redirect: If true, returns HTTP 302 redirect to the URL
+        format: Preferred format (pdf, epub, etc.)
+    """
+    if _s3_storage is None:
+        raise error_response(503, "unavailable", "Service not initialized")
+
+    hash, urn = _parse_and_validate_urn(id)
+
+    # Ensure resource is cached (fetches from upstream if needed)
+    actual_format = await _ensure_cached(hash, urn, format)
+
+    key = _s3_storage.book_key(hash, actual_format)
+    url = _s3_storage.get_presigned_url(key, f"{hash}.{actual_format}")
+
+    if redirect:
+        return RedirectResponse(url=url, status_code=302)
+    return I2LResponse(urn=urn, url=url)
+
+
+@app.get("/urn/{id:path}/urls", response_model=I2LsResponse)
+async def resolve_i2ls(
+    id: str,
+    format: str = Query("pdf", description="Preferred format if fetch needed"),
+) -> I2LsResponse:
+    """I2Ls: Resolve URN to multiple URLs.
+
+    RFC 2483 I2Ls operation. Returns all available URLs for the resource,
+    which may include different formats. Fetches from upstream if not cached.
+    """
+    if _s3_storage is None:
+        raise error_response(503, "unavailable", "Service not initialized")
+
+    hash, urn = _parse_and_validate_urn(id)
+
+    # Ensure at least one format is cached
+    await _ensure_cached(hash, urn, format)
+
+    urls = []
+    # Find all cached formats
+    for fmt in ["pdf", "epub", "djvu", "mobi", "azw3", "fb2", "cbr", "cbz"]:
+        key = _s3_storage.book_key(hash, fmt)
+        if _s3_storage.exists(key):
+            url = _s3_storage.get_presigned_url(key, f"{hash}.{fmt}")
+            urls.append(url)
+
+    return I2LsResponse(urn=urn, urls=urls)
+
+
+@app.get("/urn/{id:path}/resource")
+async def resolve_i2r(
+    id: str,
+    format: str = Query("pdf", description="Preferred format"),
+) -> StreamingResponse:
+    """I2R: Resolve URN directly to resource bytes.
+
+    RFC 2483 I2R operation. Streams the actual resource content.
+    Fetches from upstream if not cached.
+    """
+    if _s3_storage is None:
+        raise error_response(503, "unavailable", "Service not initialized")
+
+    hash, urn = _parse_and_validate_urn(id)
+
+    # Ensure resource is cached
+    actual_format = await _ensure_cached(hash, urn, format)
+
+    key = _s3_storage.book_key(hash, actual_format)
+    content = _s3_storage.download(key)
+
+    return StreamingResponse(
+        iter([content]),
+        media_type=content_type_for_format(actual_format),
+        headers={
+            "Content-Disposition": f'attachment; filename="{hash}.{actual_format}"',
+            "X-URN": urn,
+        },
+    )
+
+
+@app.get("/urn/{id:path}/metadata", response_model=I2CResponse)
+async def resolve_i2c(
+    id: str,
+    format: str = Query("pdf", description="Preferred format if fetch needed"),
+) -> I2CResponse:
+    """I2C: Resolve URN to URC (Uniform Resource Characteristics).
+
+    RFC 2483 I2C operation. Returns metadata about the resource.
+    Fetches from upstream if not cached.
+    """
+    import json
+
+    if _s3_storage is None:
+        raise error_response(503, "unavailable", "Service not initialized")
+
+    hash, urn = _parse_and_validate_urn(id)
+
+    # Ensure resource is cached
+    actual_format = await _ensure_cached(hash, urn, format)
+
+    # Load metadata
+    meta_key = _s3_storage.meta_key(hash)
+    try:
+        meta_bytes = _s3_storage.download(meta_key)
+        metadata = json.loads(meta_bytes)
+    except Exception:
+        # Metadata file missing but resource exists
+        metadata = {"hash": hash, "format": actual_format}
+
+    return I2CResponse(
+        urn=urn,
+        hash=metadata.get("hash", hash),
+        title=metadata.get("title"),
+        format=metadata.get("format", actual_format),
+        size_bytes=metadata.get("size_bytes"),
+        content_type=content_type_for_format(metadata.get("format", actual_format)),
+        cached=True,
+    )
+
+
+@app.get("/urn/{id:path}/canonical", response_model=I2NResponse)
+async def resolve_i2n(id: str) -> I2NResponse:
+    """I2N: Resolve to canonical URN.
+
+    RFC 2483 I2N operation. Normalizes the input URN to its canonical form.
+    This is useful for deduplication and comparison.
+    """
+    _, canonical = _parse_and_validate_urn(id)
+    return I2NResponse(input_urn=id, canonical_urn=canonical)
 
 
 @app.post("/books/download", response_model=BatchDownloadResponse)
@@ -252,15 +562,14 @@ async def download_books_batch(request: BatchDownloadRequest) -> BatchDownloadRe
     import asyncio
 
     if _annas_client is None or _s3_storage is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+        raise error_response(503, "unavailable", "Service not initialized")
 
-    settings = get_cached_settings()
     start_time = time.monotonic()
 
     async def download_one(book: dict) -> tuple[str, DownloadResponse | dict]:
         hash = book.get("hash", "")
         if not hash:
-            return "", {"error": "Missing hash"}
+            return "", {"error": "malformed_uri", "detail": "Missing hash"}
 
         title = book.get("title", "")
         format_hint = book.get("format", "pdf")
@@ -271,9 +580,10 @@ async def download_books_batch(request: BatchDownloadRequest) -> BatchDownloadRe
             response = await download_book_endpoint(hash, request)
             return hash, response
         except HTTPException as exc:
-            return hash, {"error": exc.detail}
+            # exc.detail is already an ErrorResponse dict
+            return hash, exc.detail if isinstance(exc.detail, dict) else {"error": "unknown", "detail": exc.detail}
         except Exception as exc:
-            return hash, {"error": str(exc)}
+            return hash, {"error": "unknown", "detail": str(exc)}
 
     # Run all downloads concurrently (semaphore is in downloader)
     tasks = [download_one(book) for book in request.books]
