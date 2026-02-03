@@ -18,4 +18,7 @@ result-*
 .env
 .env.local
 
+# Kubernetes (contains secrets)
+k8s.yaml
+
 # Keep .python-version tracked (pins 3.14t)
