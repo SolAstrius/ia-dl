@@ -1,4 +1,4 @@
-"""S3 storage operations for caching downloaded books."""
+"""S3 storage operations for caching downloaded files."""
 
 import logging
 from dataclasses import dataclass
@@ -17,23 +17,23 @@ logger = logging.getLogger(__name__)
 
 
 # Default prefixes (can be overridden via Settings)
-DEFAULT_RAW_PREFIX = "raw/annas"
-DEFAULT_META_PREFIX = "meta/annas"
+DEFAULT_RAW_PREFIX = "raw/ia"
+DEFAULT_META_PREFIX = "meta/ia"
 
 
-def build_key(hash: str, format: str, prefix: str = DEFAULT_RAW_PREFIX) -> str:
-    """Build S3 key for a book file."""
-    return f"{prefix}/{hash}.{format}"
+def build_key(identifier: str, format: str, prefix: str = DEFAULT_RAW_PREFIX) -> str:
+    """Build S3 key for a file."""
+    return f"{prefix}/{identifier}.{format}"
 
 
-def build_meta_key(hash: str, prefix: str = DEFAULT_META_PREFIX) -> str:
-    """Build S3 key for book metadata."""
-    return f"{prefix}/{hash}.json"
+def build_meta_key(identifier: str, prefix: str = DEFAULT_META_PREFIX) -> str:
+    """Build S3 key for item metadata."""
+    return f"{prefix}/{identifier}.json"
 
 
 @dataclass
 class S3Storage:
-    """S3 storage backend for book caching."""
+    """S3 storage backend for file caching."""
 
     _client: "S3Client"
     _bucket: str
@@ -66,13 +66,13 @@ class S3Storage:
             _meta_prefix=settings.s3_meta_prefix,
         )
 
-    def book_key(self, hash: str, format: str) -> str:
-        """Build S3 key for a book file using configured prefix."""
-        return build_key(hash, format, self._raw_prefix)
+    def book_key(self, identifier: str, format: str) -> str:
+        """Build S3 key for a file using configured prefix."""
+        return build_key(identifier, format, self._raw_prefix)
 
-    def meta_key(self, hash: str) -> str:
+    def meta_key(self, identifier: str) -> str:
         """Build S3 key for metadata using configured prefix."""
-        return build_meta_key(hash, self._meta_prefix)
+        return build_meta_key(identifier, self._meta_prefix)
 
     def exists(self, key: str) -> bool:
         """Check if a key exists in S3."""
@@ -131,7 +131,7 @@ class S3Storage:
 
 
 def content_type_for_format(format: str) -> str:
-    """Get MIME content type for ebook format."""
+    """Get MIME content type for file format."""
     return {
         "epub": "application/epub+zip",
         "pdf": "application/pdf",
@@ -141,4 +141,11 @@ def content_type_for_format(format: str) -> str:
         "djvu": "image/vnd.djvu",
         "cbr": "application/x-cbr",
         "cbz": "application/x-cbz",
+        "txt": "text/plain",
+        "html": "text/html",
+        "xml": "application/xml",
+        "mp3": "audio/mpeg",
+        "mp4": "video/mp4",
+        "zip": "application/zip",
+        "jp2": "image/jp2",
     }.get(format, "application/octet-stream")

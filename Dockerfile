@@ -29,5 +29,5 @@ ENV PATH="/app/.venv/bin:$PATH"
 
 EXPOSE 8000
 
-ENTRYPOINT ["annas-dl"]
+ENTRYPOINT ["ia-dl"]
 CMD ["serve"]
