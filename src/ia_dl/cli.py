@@ -121,6 +121,10 @@ async def test_metadata(id: str, full: bool = False) -> None:
             p("ARK", meta.ark)
             p("OpenLibrary Edition", meta.openlibrary_edition)
             p("OpenLibrary Work", meta.openlibrary_work)
+            if meta.external_identifier:
+                print("External Identifiers:")
+                for ext_id in meta.external_identifier:
+                    print(f"  - {ext_id}")
 
             print("\n=== Contributors ===")
             p("Contributor", meta.contributor)
@@ -224,6 +228,55 @@ async def test_metadata(id: str, full: bool = False) -> None:
         await client.close()
 
 
+async def test_search(query: str, rows: int = 20, mediatype: str | None = None) -> None:
+    """Test searching the Internet Archive."""
+    from .ia_client import IAClient
+    from .config import get_settings
+
+    settings = get_settings()
+    client = IAClient.create(
+        timeout=30.0,
+        access_key=settings.ia_access_key,
+        secret_key=settings.ia_secret_key,
+    )
+
+    print(f"Searching: {query}")
+    if mediatype:
+        print(f"  Mediatype filter: {mediatype}")
+
+    try:
+        result = await client.search(
+            query=query,
+            rows=rows,
+            mediatype=mediatype,
+        )
+
+        print(f"\nFound {result.total} results (showing {result.count}):\n")
+
+        for item in result.items:
+            # Format creators
+            creators = ", ".join(item.creator[:2])
+            if len(item.creator) > 2:
+                creators += f" +{len(item.creator) - 2} more"
+
+            # Format size
+            size_mb = item.item_size / 1024 / 1024 if item.item_size else 0
+
+            print(f"  {item.to_urn()}")
+            print(f"    Title: {item.title[:70]}{'...' if len(item.title) > 70 else ''}")
+            if creators:
+                print(f"    Creator: {creators}")
+            if item.year:
+                print(f"    Year: {item.year}")
+            if item.formats:
+                print(f"    Formats: {', '.join(item.formats)}")
+            print(f"    Downloads: {item.downloads:,}  Size: {size_mb:.1f} MB")
+            print()
+
+    finally:
+        await client.close()
+
+
 async def test_api(id: str, format: str = "pdf") -> None:
     """Test the full API endpoint (requires S3 config)."""
     import httpx
@@ -281,12 +334,20 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  ia-dl search "creator:dickens" --mediatype texts
+  ia-dl search "title:great expectations" --rows 10
   ia-dl download --id taleoftwocities00dick
   ia-dl download --id taleoftwocities00dick --format epub
   ia-dl download --id 'urn:ia:taleoftwocities00dick?+format=epub'  # RFC 8141
   ia-dl metadata --id taleoftwocities00dick
   ia-dl serve
   ia-dl api --id taleoftwocities00dick
+
+Search query syntax (Lucene):
+  creator:dickens              - Search by creator
+  title:"great expectations"   - Exact phrase in title
+  dickens AND london           - Boolean AND
+  year:[1800 TO 1900]          - Year range
 
 URN Format (RFC 8141):
   urn:ia:<identifier>[?+r-component][?=q-component][#f-component]
@@ -296,7 +357,7 @@ URN Format (RFC 8141):
   f-component: Fragment identifier (e.g., #chapter1)
 """,
     )
-    parser.add_argument("command", choices=["download", "metadata", "api", "serve"])
+    parser.add_argument("command", choices=["search", "download", "metadata", "api", "serve"])
     parser.add_argument(
         "--id", "-i",
         help="Item URN (urn:ia:<identifier>) or raw identifier",
@@ -304,12 +365,22 @@ URN Format (RFC 8141):
     )
     parser.add_argument("--format", "-f", default="pdf", help="Format preference (default: pdf)")
     parser.add_argument("--full", action="store_true", help="Show complete metadata (for metadata command)")
+    parser.add_argument("--rows", "-n", type=int, default=20, help="Number of search results (default: 20)")
+    parser.add_argument("--mediatype", "-m", default="texts", help="Filter search by mediatype (default: texts)")
+    parser.add_argument("query", nargs="?", help="Search query (for search command)")
 
     args = parser.parse_args()
 
     if args.command == "serve":
         from .main import main as serve_main
         serve_main()
+
+    elif args.command == "search":
+        if not args.query:
+            print("Error: search query required")
+            print("Usage: ia-dl search 'creator:dickens'")
+            sys.exit(1)
+        asyncio.run(test_search(args.query, args.rows, args.mediatype))
 
     elif args.command == "download":
         if not args.id:

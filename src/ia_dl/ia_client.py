@@ -66,6 +66,7 @@ class ItemMetadata:
     ark: str = ""  # identifier-ark
     openlibrary_edition: str = ""
     openlibrary_work: str = ""
+    external_identifier: list[str] = field(default_factory=list)  # ACS6, LCP, OCLC record URNs
 
     # === Contributors ===
     contributor: str | list[str] = ""  # Digitizing organization
@@ -136,16 +137,23 @@ class ItemMetadata:
     def get_best_file(self, preferred_formats: list[str] | None = None) -> FileInfo | None:
         """Get the best file to download based on format preference.
 
+        Excludes DRM-protected files (LCP, ACS encrypted).
+
         Args:
             preferred_formats: List of formats in order of preference (e.g., ["pdf", "epub", "djvu"])
 
         Returns:
-            Best matching FileInfo or None if no files
+            Best matching FileInfo or None if no unprotected files
         """
         if not self.files:
             return None
 
-        preferred_formats = preferred_formats or ["pdf", "epub", "djvu", "mobi", "txt"]
+        preferred_formats = preferred_formats or ["pdf", "epub", "fb2", "mobi", "djvu", "txt"]
+
+        def is_protected(fmt: str) -> bool:
+            """Check if format is DRM-protected."""
+            fmt_lower = fmt.lower()
+            return any(drm in fmt_lower for drm in ("lcp", "acs", "encrypted", "protected"))
 
         def normalize_format(fmt: str) -> str:
             """Normalize IA format names to standard extensions."""
@@ -171,22 +179,27 @@ class ItemMetadata:
                 return "ogv"
             return fmt
 
+        # Filter out protected files upfront
+        unprotected_files = [f for f in self.files if not is_protected(f.format)]
+        if not unprotected_files:
+            return None
+
         # First pass: original files in preferred format order
         for fmt in preferred_formats:
-            for f in self.files:
+            for f in unprotected_files:
                 if normalize_format(f.format) == fmt and f.source == "original":
                     return f
 
         # Second pass: any file in preferred format order (including derivatives)
         for fmt in preferred_formats:
-            for f in self.files:
+            for f in unprotected_files:
                 if normalize_format(f.format) == fmt:
                     return f
 
         # Fallback: largest original file (excluding metadata files)
         skip_formats = {"metadata", "item tile", "archive bittorrent", "sqlite"}
         originals = [
-            f for f in self.files
+            f for f in unprotected_files
             if f.source == "original" and f.format.lower() not in skip_formats
         ]
         if originals:
@@ -194,7 +207,7 @@ class ItemMetadata:
 
         # Last resort: largest file (excluding metadata)
         content_files = [
-            f for f in self.files
+            f for f in unprotected_files
             if f.format.lower() not in skip_formats
         ]
         return max(content_files, key=lambda f: f.size) if content_files else None
@@ -256,6 +269,9 @@ class ItemMetadata:
             same_as.append(f"https://openlibrary.org/works/{self.openlibrary_work}")
         for d in self.doi:
             same_as.append(f"https://doi.org/{d}")
+        # External identifiers (ACS6, LCP, OCLC records) - already URNs
+        for ext_id in self.external_identifier:
+            same_as.append(ext_id)
 
         doc["sameAs"] = same_as
 
@@ -362,6 +378,220 @@ class ItemNotFoundError(IAClientError):
 class RateLimitedError(IAClientError):
     """Rate limited by Internet Archive (429/503)."""
     pass
+
+
+@dataclass
+class SearchItem:
+    """A single search result item with normalized fields."""
+
+    identifier: str
+    title: str
+    creator: list[str]
+    publisher: str
+    date: str
+    year: int | None
+    language: str
+    mediatype: str
+    formats: list[str]  # Normalized format extensions (pdf, epub, djvu, etc.)
+    downloads: int
+    item_size: int
+    imagecount: int
+    collection: list[str]
+    subject: list[str]
+
+    def to_urn(self) -> str:
+        """Return URN for this item."""
+        return f"urn:ia:{self.identifier}"
+
+
+@dataclass
+class SearchResult:
+    """Search results with pagination info."""
+
+    total: int
+    start: int
+    items: list[SearchItem]
+    query: str
+
+    @property
+    def count(self) -> int:
+        """Number of items in this page."""
+        return len(self.items)
+
+
+def _is_advanced_query(query: str) -> bool:
+    """Check if query uses Lucene/advanced search syntax.
+
+    Returns True if query contains:
+    - Boolean operators: AND, OR, NOT (uppercase)
+    - Field prefixes: title:, creator:, year:, etc.
+    - Range queries: [2000 TO 2020]
+    - Grouping: (term1 OR term2)
+    - Wildcards: term*, te?m
+    - Already quoted phrases: "exact phrase"
+    - Explicit exclusions: -term
+    """
+    import re
+
+    # Check for boolean operators (must be uppercase and surrounded by spaces/boundaries)
+    if re.search(r'\b(AND|OR|NOT)\b', query):
+        return True
+
+    # Check for field:value syntax
+    if re.search(r'\b\w+:', query):
+        return True
+
+    # Check for range queries [x TO y]
+    if '[' in query and ' TO ' in query:
+        return True
+
+    # Check for grouping parentheses (but not in natural text)
+    if '(' in query and ')' in query:
+        return True
+
+    # Check for wildcards
+    if '*' in query or '?' in query:
+        return True
+
+    # Check for already-quoted phrases
+    if '"' in query:
+        return True
+
+    # Check for explicit exclusions
+    if re.search(r'\s-\w', query) or query.startswith('-'):
+        return True
+
+    return False
+
+
+def _process_search_query(query: str) -> str:
+    """Process search query, auto-quoting only comma-separated queries.
+
+    Comma signals "title, author" pattern - each part is quoted as a phrase:
+    - "Great Expectations, Dickens" -> "Great Expectations" Dickens
+
+    No comma = topic/conceptual search - passed as separate terms:
+    - "19th century maritime navigation" -> 19th century maritime navigation
+
+    Advanced queries (AND, OR, field:value, etc.) pass through unchanged.
+
+    Args:
+        query: User's search query
+
+    Returns:
+        Processed query ready for IA API
+    """
+    query = query.strip()
+
+    if not query:
+        return query
+
+    # If it's an advanced query, pass through as-is
+    if _is_advanced_query(query):
+        return query
+
+    # Only auto-quote if comma present (signals title, author pattern)
+    if ',' in query:
+        # Split on comma: "Great Expectations, Dickens" -> ["Great Expectations", "Dickens"]
+        parts = [p.strip() for p in query.split(',') if p.strip()]
+        # Quote multi-word parts as phrases
+        quoted = [f'"{p}"' if ' ' in p else p for p in parts]
+        return ' '.join(quoted)
+
+    # No comma = topic search, pass through as terms (not quoted)
+    return query
+
+
+def _is_protected_format(fmt: str) -> bool:
+    """Check if a format is DRM-protected (LCP, ACS, etc.)."""
+    fmt_lower = fmt.lower()
+    return any(drm in fmt_lower for drm in ("lcp", "acs", "encrypted", "protected"))
+
+
+def _normalize_formats(raw_formats: list[str]) -> list[str]:
+    """Normalize IA format names to lowercase file extensions.
+
+    IA uses verbose format names like "Text PDF", "EPUB", "DjVu".
+    This normalizes them to simple extensions: pdf, epub, djvu.
+
+    Excludes DRM-protected formats (LCP, ACS encrypted).
+    """
+    normalized = set()
+
+    format_map = {
+        # Documents (unprotected only)
+        "text pdf": "pdf",
+        "pdf": "pdf",
+        # Skip protected formats - they map to None
+        "acs encrypted pdf": None,
+        "lcp encrypted pdf": None,
+        "lcp encrypted epub": None,
+        "epub": "epub",
+        "djvu": "djvu",
+        "mobi": "mobi",
+        "kindle": "mobi",
+        # Text
+        "plain text": "txt",
+        "text": "txt",
+        "djvutxt": "txt",
+        "ocr search text": "txt",
+        # Data formats
+        "abbyy gz": "abbyy",
+        "hocr": "hocr",
+        "chocr": "chocr",
+        # Images
+        "jpeg": "jpg",
+        "jpeg thumb": "jpg",
+        "png": "png",
+        "gif": "gif",
+        "animated gif": "gif",
+        "jp2": "jp2",
+        "single page original jp2 tar": "jp2",
+        "single page processed jp2 zip": "jp2",
+        # Audio/Video
+        "mp3": "mp3",
+        "ogg vorbis": "ogg",
+        "mp4": "mp4",
+        "ogv": "ogv",
+        "webm": "webm",
+        # Archives
+        "zip": "zip",
+        "tar": "tar",
+        # Metadata (skip these)
+        "metadata": None,
+        "item tile": None,
+        "archive bittorrent": None,
+        "sqlite": None,
+        "json": None,
+        "xml": None,
+        "dublin core": None,
+        "marc": None,
+        "marc binary": None,
+        "marc source": None,
+        "mets": None,
+        "scandata": None,
+        "log": None,
+        "metadata log": None,
+    }
+
+    for fmt in raw_formats:
+        fmt_lower = fmt.lower().strip()
+
+        # Skip any protected/encrypted formats
+        if _is_protected_format(fmt_lower):
+            continue
+
+        if fmt_lower in format_map:
+            if format_map[fmt_lower]:
+                normalized.add(format_map[fmt_lower])
+        else:
+            # Try to extract extension from unknown formats
+            for ext in ["pdf", "epub", "djvu", "mobi", "txt", "mp3", "mp4"]:
+                if ext in fmt_lower:
+                    normalized.add(ext)
+                    break
+
+    return sorted(normalized)
 
 
 class IAClient:
@@ -499,6 +729,7 @@ class IAClient:
                 ark=as_str(metadata.get("identifier-ark")),
                 openlibrary_edition=as_str(metadata.get("openlibrary_edition")),
                 openlibrary_work=as_str(metadata.get("openlibrary_work")),
+                external_identifier=as_list(metadata.get("external-identifier")),
 
                 # Contributors
                 contributor=metadata.get("contributor", ""),
@@ -610,6 +841,204 @@ class IAClient:
             raise IAClientError(f"HTTP error: {exc}") from exc
         except httpx.RequestError as exc:
             raise IAClientError(f"Request failed: {exc}") from exc
+
+    async def search(
+        self,
+        query: str,
+        rows: int = 50,
+        page: int = 1,
+        sort: str | None = "downloads desc",
+        mediatype: str | None = None,
+        year_min: int | None = None,
+        year_max: int | None = None,
+        language: str | None = None,
+    ) -> SearchResult:
+        """Search Internet Archive using the Advanced Search API.
+
+        Args:
+            query: Search query - natural language or Lucene syntax.
+                   Natural: "Great Expectations, Dickens" -> auto-quoted phrases
+                   Advanced: "title:expectations AND creator:dickens" -> passed as-is
+            rows: Number of results per page (max 10000)
+            page: Page number (1-indexed)
+            sort: Sort field and direction (default: "downloads desc")
+            mediatype: Filter by mediatype (e.g., "texts", "audio", "movies")
+            year_min: Filter by minimum publication year
+            year_max: Filter by maximum publication year
+            language: Filter by language code (e.g., "eng", "fra", "deu")
+
+        Returns:
+            SearchResult with items and pagination info
+
+        Raises:
+            IAClientError: On API errors
+        """
+        # Process query - auto-quote if it's a natural language query
+        processed_query = _process_search_query(query)
+
+        # Build query with filters
+        q_parts = [processed_query]
+
+        # Exclude restricted-access items (controlled digital lending)
+        q_parts.append("-collection:printdisabled")
+        q_parts.append("-collection:inlibrary")
+        q_parts.append("-access-restricted-item:true")
+
+        if mediatype:
+            q_parts.append(f"mediatype:{mediatype}")
+        if year_min and year_max:
+            q_parts.append(f"year:[{year_min} TO {year_max}]")
+        elif year_min:
+            q_parts.append(f"year:[{year_min} TO *]")
+        elif year_max:
+            q_parts.append(f"year:[* TO {year_max}]")
+        if language:
+            q_parts.append(f"language:{language}")
+
+        full_query = " AND ".join(q_parts) if len(q_parts) > 1 else q_parts[0]
+
+        # Fields to request
+        fields = [
+            "identifier", "title", "creator", "publisher", "date", "year",
+            "language", "mediatype", "format", "downloads", "item_size",
+            "imagecount", "collection", "subject", "access-restricted-item",
+        ]
+
+        params: dict = {
+            "q": full_query,
+            "output": "json",
+            "rows": min(rows, 10000),
+            "start": (page - 1) * rows,
+        }
+
+        # Add fields as multiple fl[] params
+        for f in fields:
+            params.setdefault("fl[]", []).append(f) if isinstance(params.get("fl[]"), list) else None
+        params["fl[]"] = fields
+
+        if sort:
+            params["sort[]"] = sort
+
+        url = f"{IA_BASE_URL}/advancedsearch.php"
+
+        logger.debug("Searching: %s with query=%s", url, full_query)
+
+        def parse_doc(doc: dict) -> SearchItem | None:
+            """Parse a doc into SearchItem, returning None if it should be filtered."""
+            # Normalize formats (excludes DRM-protected formats)
+            raw_formats = doc.get("format", [])
+            if isinstance(raw_formats, str):
+                raw_formats = [raw_formats]
+            normalized_formats = _normalize_formats(raw_formats)
+
+            # Skip items with no unprotected formats
+            if not normalized_formats:
+                return None
+
+            # Skip access-restricted items (belt-and-suspenders with query filter)
+            if doc.get("access-restricted-item") == "true":
+                return None
+
+            # Handle list fields
+            creator = doc.get("creator", [])
+            if isinstance(creator, str):
+                creator = [creator] if creator else []
+
+            collection = doc.get("collection", [])
+            if isinstance(collection, str):
+                collection = [collection] if collection else []
+
+            subject = doc.get("subject", [])
+            if isinstance(subject, str):
+                subject = [subject] if subject else []
+
+            # Language can be string or list of strings
+            language = doc.get("language", "")
+            if isinstance(language, list):
+                language = ",".join(language) if language else ""
+            language = language or ""
+
+            return SearchItem(
+                identifier=doc.get("identifier", ""),
+                title=doc.get("title", ""),
+                creator=creator,
+                publisher=doc.get("publisher", "") or "",
+                date=doc.get("date", "") or "",
+                year=int(doc["year"]) if doc.get("year") else None,
+                language=language,
+                mediatype=doc.get("mediatype", "") or "",
+                formats=normalized_formats,
+                downloads=int(doc.get("downloads", 0) or 0),
+                item_size=int(doc.get("item_size", 0) or 0),
+                imagecount=int(doc.get("imagecount", 0) or 0),
+                collection=collection,
+                subject=subject,
+            )
+
+        try:
+            items: list[SearchItem] = []
+            total_from_api = 0
+            filtered_count = 0
+            current_start = (page - 1) * rows
+            max_attempts = 3  # Avoid infinite loops
+
+            for attempt in range(max_attempts):
+                params["start"] = current_start
+                # Request extra to compensate for filtering (2x on retries)
+                params["rows"] = min((rows - len(items)) * (attempt + 1), 10000)
+
+                response = await self._http.get(
+                    url,
+                    params=params,
+                    headers=self._auth_headers(),
+                    timeout=self._timeout,
+                )
+
+                if response.status_code in (429, 503):
+                    raise RateLimitedError("Rate limited during search")
+
+                response.raise_for_status()
+                data = response.json()
+
+                response_data = data.get("response", {})
+                if attempt == 0:
+                    total_from_api = response_data.get("numFound", 0)
+
+                docs = response_data.get("docs", [])
+                if not docs:
+                    break  # No more results
+
+                for doc in docs:
+                    parsed = parse_doc(doc)
+                    if parsed:
+                        items.append(parsed)
+                        if len(items) >= rows:
+                            break
+                    else:
+                        filtered_count += 1
+
+                if len(items) >= rows:
+                    break
+
+                # Move start forward for next batch
+                current_start += len(docs)
+                if current_start >= total_from_api:
+                    break  # Exhausted all results
+
+            # Adjust total to account for filtered items (estimate)
+            estimated_total = max(0, total_from_api - filtered_count)
+
+            return SearchResult(
+                total=estimated_total,
+                start=(page - 1) * rows,
+                items=items[:rows],  # Trim to requested size
+                query=full_query,
+            )
+
+        except httpx.HTTPStatusError as exc:
+            raise IAClientError(f"Search HTTP error: {exc}") from exc
+        except httpx.RequestError as exc:
+            raise IAClientError(f"Search request failed: {exc}") from exc
 
     async def close(self):
         """Close the HTTP client."""

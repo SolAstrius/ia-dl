@@ -21,6 +21,8 @@ from .ia_client import (
     ItemMetadata,
     ItemNotFoundError,
     RateLimitedError,
+    SearchItem,
+    SearchResult,
 )
 from .config import Settings, get_settings
 from .downloader import DownloadError, download_item
@@ -94,7 +96,7 @@ app = FastAPI(
 class DownloadRequest(BaseModel):
     """Request to download an item."""
 
-    preferred_formats: list[str] = ["pdf", "epub", "djvu"]
+    preferred_formats: list[str] = ["pdf", "epub", "fb2", "mobi", "djvu"]
     specific_file: str | None = None  # Download specific file instead of auto-selecting
 
 
@@ -132,6 +134,88 @@ class HealthResponse(BaseModel):
 
     status: str
     version: str
+
+
+# =============================================================================
+# Search Models
+# =============================================================================
+
+
+class SearchItemResponse(BaseModel):
+    """A single search result item with normalized fields.
+
+    All format names are normalized to lowercase file extensions (pdf, epub, djvu)
+    rather than IA's verbose names (Text PDF, EPUB, DjVu).
+    """
+
+    id: str
+    """URN identifier: urn:ia:<identifier>. Use this for download/metadata endpoints."""
+
+    identifier: str
+    """Internet Archive item identifier (the part after urn:ia:)."""
+
+    title: str
+    """Item title."""
+
+    creator: list[str]
+    """Author(s) / creator(s)."""
+
+    publisher: str
+    """Publisher name."""
+
+    date: str
+    """Publication date (ISO format when available)."""
+
+    year: int | None
+    """Publication year (extracted from date)."""
+
+    language: str
+    """ISO 639-2 language code (eng, fra, deu, etc.)."""
+
+    mediatype: str
+    """IA mediatype: texts, audio, movies, software, image, data, web, collection."""
+
+    formats: list[str]
+    """Available formats as normalized lowercase extensions: pdf, epub, djvu, txt, mp3, etc.
+    Excludes metadata formats (json, xml, marc, etc.)."""
+
+    downloads: int
+    """Total download count (all time)."""
+
+    item_size: int
+    """Total size of all files in bytes."""
+
+    imagecount: int
+    """Number of page images (for scanned books)."""
+
+    collection: list[str]
+    """IA collections this item belongs to."""
+
+    subject: list[str]
+    """Subject tags/keywords."""
+
+
+class SearchResponse(BaseModel):
+    """Paginated search results.
+
+    Results are sorted by downloads (most popular first) by default.
+    Use the `sort` query parameter to change sort order.
+    """
+
+    total: int
+    """Total number of matching items across all pages."""
+
+    page: int
+    """Current page number (1-indexed)."""
+
+    rows: int
+    """Number of results requested per page."""
+
+    items: list[SearchItemResponse]
+    """Search results for this page."""
+
+    query: str
+    """The processed query that was sent to Internet Archive (useful for debugging)."""
 
 
 # =============================================================================
@@ -209,6 +293,7 @@ class ItemInfoResponse(BaseModel):
     isbn: list[str] = []
     oclc: list[str] = []
     lccn: list[str] = []
+    external_identifier: list[str] = []  # ACS6, LCP, OCLC record URNs
 
     # Available files (name, format, size)
     files: list[dict] = []
@@ -251,7 +336,156 @@ async def health_check() -> HealthResponse:
     return HealthResponse(status="ok", version="0.1.0")
 
 
-@app.post("/item/{id:path}/download", response_model=DownloadResponse)
+@app.get("/search", response_model=SearchResponse, tags=["Search"])
+@app.get("/items/search", response_model=SearchResponse, tags=["Search"], deprecated=True)
+async def search_items(
+    q: str = Query(
+        ...,
+        description="Search query. Supports natural language or Lucene syntax. "
+        "Use comma to separate title and author: 'Great Expectations, Dickens'. "
+        "Without comma, terms are searched independently: '19th century maritime navigation'.",
+        examples=["Great Expectations, Dickens", "19th century maritime navigation", "creator:dickens AND year:[1850 TO 1870]"],
+    ),
+    rows: int = Query(50, ge=1, le=1000, description="Results per page (max 1000)"),
+    page: int = Query(1, ge=1, description="Page number (1-indexed)"),
+    sort: str | None = Query(
+        None,
+        description="Sort field and direction. Default: 'downloads desc'. "
+        "Options: downloads, date, title, creator, publicdate (each with 'asc' or 'desc').",
+        examples=["downloads desc", "date asc", "title asc"],
+    ),
+    mediatype: str | None = Query(
+        None,
+        description="Filter by mediatype",
+        examples=["texts", "audio", "movies", "software", "image"],
+    ),
+    year_min: int | None = Query(None, description="Minimum publication year", examples=[1800, 1900, 2000]),
+    year_max: int | None = Query(None, description="Maximum publication year", examples=[1900, 2000, 2024]),
+    language: str | None = Query(
+        None,
+        description="Filter by ISO 639-2 language code",
+        examples=["eng", "fra", "deu", "spa", "rus"],
+    ),
+    format: str | None = Query(
+        None,
+        description="Filter by format (normalized lowercase). Added to query as format filter.",
+        examples=["pdf", "epub", "djvu", "mp3"],
+    ),
+) -> SearchResponse:
+    """Search Internet Archive items.
+
+    ## Query Syntax
+
+    The search supports two modes, automatically detected:
+
+    ### Natural Language (recommended for most searches)
+
+    **With comma** — Title + Author pattern. Each part is quoted as a phrase:
+    - `Great Expectations, Dickens` → searches for "Great Expectations" AND Dickens
+    - `War and Peace, Tolstoy` → searches for "War and Peace" AND Tolstoy
+
+    **Without comma** — Topic/conceptual search. Terms searched independently:
+    - `19th century maritime navigation` → finds books about maritime navigation in the 19th century
+    - `french revolution causes` → finds books discussing causes of the French revolution
+
+    ### Advanced Lucene Syntax
+
+    For precise control, use Lucene query syntax (auto-detected):
+
+    | Syntax | Example | Description |
+    |--------|---------|-------------|
+    | Field search | `creator:dickens` | Search specific field |
+    | Phrase | `title:"great expectations"` | Exact phrase match |
+    | Boolean | `dickens AND london` | Both terms required |
+    | OR | `dickens OR thackeray` | Either term |
+    | NOT | `dickens NOT christmas` | Exclude term |
+    | Wildcard | `dick*` | Prefix matching |
+    | Range | `year:[1800 TO 1900]` | Numeric/date range |
+    | Grouping | `(dickens OR austen) AND london` | Complex queries |
+
+    ## Response Format
+
+    - **id**: URN identifier (`urn:ia:<identifier>`)
+    - **formats**: Normalized lowercase extensions (`["pdf", "epub"]` not `["Text PDF", "EPUB"]`)
+    - **Results sorted by downloads** (most popular first) unless `sort` specified
+
+    ## Examples
+
+    | Query | Finds |
+    |-------|-------|
+    | `Great Expectations, Dickens` | The novel by Charles Dickens |
+    | `19th century maritime navigation` | Books about sailing/navigation history |
+    | `creator:dickens year:[1850 TO 1870]` | Dickens works from 1850-1870 |
+    | `subject:philosophy language:grc` | Philosophy texts in Greek |
+    """
+    if _ia_client is None:
+        raise error_response(503, "unavailable", "Service not initialized")
+
+    # Add format filter to query if specified
+    full_query = q
+    if format:
+        # IA format field uses verbose names, but we accept normalized names
+        format_map = {
+            "pdf": "PDF",
+            "epub": "EPUB",
+            "djvu": "DjVu",
+            "mobi": "Mobi",
+            "txt": "Text",
+            "mp3": "MP3",
+            "mp4": "MP4",
+        }
+        ia_format = format_map.get(format.lower(), format)
+        full_query = f"({q}) AND format:{ia_format}"
+
+    try:
+        result = await _ia_client.search(
+            query=full_query,
+            rows=rows,
+            page=page,
+            sort=sort,
+            mediatype=mediatype,
+            year_min=year_min,
+            year_max=year_max,
+            language=language,
+        )
+    except RateLimitedError as exc:
+        raise error_response(429, "quota_exceeded", str(exc))
+    except IAClientError as exc:
+        raise error_response(502, "upstream_error", str(exc))
+
+    # Convert to response format with URNs
+    items = [
+        SearchItemResponse(
+            id=item.to_urn(),
+            identifier=item.identifier,
+            title=item.title,
+            creator=item.creator,
+            publisher=item.publisher,
+            date=item.date,
+            year=item.year,
+            language=item.language,
+            mediatype=item.mediatype,
+            formats=item.formats,
+            downloads=item.downloads,
+            item_size=item.item_size,
+            imagecount=item.imagecount,
+            collection=item.collection,
+            subject=item.subject,
+        )
+        for item in result.items
+    ]
+
+    return SearchResponse(
+        total=result.total,
+        page=page,
+        rows=rows,
+        items=items,
+        query=result.query,
+    )
+
+
+@app.post("/download/{id:path}", response_model=DownloadResponse)
+@app.post("/item/{id:path}/download", response_model=DownloadResponse, deprecated=True)
 async def download_item_endpoint(
     id: str,
     request: DownloadRequest | None = None,
@@ -283,7 +517,7 @@ async def download_item_endpoint(
 
     settings = get_cached_settings()
 
-    preferred_formats = request.preferred_formats if request else ["pdf", "epub", "djvu"]
+    preferred_formats = request.preferred_formats if request else ["pdf", "epub", "fb2", "mobi", "djvu"]
     specific_file = request.specific_file if request else None
 
     # Check cache - look for any of the preferred formats
@@ -430,7 +664,7 @@ async def _ensure_cached(
     if _ia_client is None or _s3_storage is None:
         raise error_response(503, "unavailable", "Service not initialized")
 
-    preferred_formats = preferred_formats or ["pdf", "epub", "djvu"]
+    preferred_formats = preferred_formats or ["pdf", "epub", "fb2", "mobi", "djvu"]
 
     # Check cache based on whether format was explicitly requested
     if format_required:
@@ -705,6 +939,7 @@ async def get_item_info(
         isbn=meta.isbn,
         oclc=meta.oclc,
         lccn=meta.lccn,
+        external_identifier=meta.external_identifier,
         files=files,
     )
 
@@ -751,7 +986,8 @@ async def resolve_i2l(
     return I2LResponse(urn=urn, url=url)
 
 
-@app.post("/items/download", response_model=BatchDownloadResponse)
+@app.post("/download", response_model=BatchDownloadResponse)
+@app.post("/items/download", response_model=BatchDownloadResponse, deprecated=True)
 async def download_items_batch(request: BatchDownloadRequest) -> BatchDownloadResponse:
     """Download multiple items in parallel.
 
@@ -775,7 +1011,7 @@ async def download_items_batch(request: BatchDownloadRequest) -> BatchDownloadRe
         if not identifier:
             return "", {"error": "malformed_uri", "detail": "Missing identifier"}
 
-        preferred_formats = item.get("preferred_formats", ["pdf", "epub", "djvu"])
+        preferred_formats = item.get("preferred_formats", ["pdf", "epub", "fb2", "mobi", "djvu"])
         specific_file = item.get("specific_file")
 
         try:

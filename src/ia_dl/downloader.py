@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 import httpx
 
 if TYPE_CHECKING:
-    from .ia_client import IAClient, ItemMetadata
+    from .ia_client import IAClient, ItemMetadata, FileInfo
     from .config import Settings
 
 logger = logging.getLogger(__name__)
@@ -40,15 +40,77 @@ class DownloadError(Exception):
         self.last_status = last_status
 
 
-def detect_format_from_filename(filename: str) -> str:
-    """Detect file format from filename extension."""
+def normalize_ia_format(format_name: str) -> str:
+    """Normalize IA format name to a file extension.
+
+    IA uses verbose names like "Text PDF", "DjVu", "EPUB".
+    This normalizes them to simple extensions: pdf, djvu, epub.
+    """
+    fmt = format_name.lower()
+
+    # Document formats
+    if "pdf" in fmt:
+        return "pdf"
+    if "djvu" in fmt:
+        return "djvu"
+    if "epub" in fmt:
+        return "epub"
+    if "mobi" in fmt or "kindle" in fmt:
+        return "mobi"
+    if fmt in ("txt", "text", "plain text", "djvutxt", "ocr search text"):
+        return "txt"
+
+    # Web/markup
+    if fmt in ("html", "htm") or "html" in fmt:
+        return "html"
+
+    # Images
+    if "jp2" in fmt:
+        return "jp2"
+    if fmt in ("jpeg", "jpg") or "jpeg" in fmt:
+        return "jpg"
+    if fmt == "png":
+        return "png"
+    if fmt == "gif" or "gif" in fmt:
+        return "gif"
+
+    # Audio/video
+    if "mp3" in fmt:
+        return "mp3"
+    if "mp4" in fmt or "mpeg4" in fmt:
+        return "mp4"
+    if "ogv" in fmt or "ogg video" in fmt:
+        return "ogv"
+    if "ogg" in fmt:
+        return "ogg"
+
+    # Archives
+    if fmt == "zip":
+        return "zip"
+    if fmt == "tar":
+        return "tar"
+
+    return "bin"
+
+
+def detect_format(file_info: "FileInfo") -> str:
+    """Detect file format from FileInfo.
+
+    Uses the IA format field first (more reliable), falls back to filename extension.
+    """
+    # First try the format field from IA metadata
+    if file_info.format:
+        normalized = normalize_ia_format(file_info.format)
+        if normalized != "bin":
+            return normalized
+
+    # Fall back to filename extension
+    filename = file_info.name
     if "." in filename:
         ext = filename.rsplit(".", 1)[-1].lower()
-        # Normalize some IA-specific formats
-        if ext in ("pdf", "epub", "djvu", "mobi", "azw3", "fb2", "cbr", "cbz", "txt"):
+        if ext in ("pdf", "epub", "djvu", "mobi", "azw3", "fb2", "cbr", "cbz", "txt", "html", "htm", "jp2", "mp3", "mp4"):
             return ext
-        if ext == "jp2":
-            return "jp2"
+
     return "bin"
 
 
@@ -105,7 +167,7 @@ async def download_item(
             raise DownloadError(f"No downloadable files in item: {identifier}", 404)
 
     filename = target_file.name
-    detected_format = detect_format_from_filename(filename)
+    detected_format = detect_format(target_file)
 
     logger.info(
         "Downloading %s/%s (format=%s, size=%d bytes)",
