@@ -593,6 +593,27 @@ async def download_item_endpoint(
         # Include JSON-LD for interoperability
         base_url = settings.base_url or ""
         metadata["jsonld"] = item_meta.to_jsonld(urn, base_url)
+        # Promote key fields to top level for MCP server compatibility
+        if item_meta.title:
+            metadata["title"] = item_meta.title
+        if item_meta.creator:
+            if isinstance(item_meta.creator, list):
+                metadata["authors"] = ", ".join(item_meta.creator)
+            else:
+                metadata["authors"] = item_meta.creator
+        if item_meta.publisher:
+            metadata["publisher"] = item_meta.publisher
+        if item_meta.language:
+            metadata["language"] = item_meta.language
+        if item_meta.item_size:
+            b = item_meta.item_size
+            metadata["size"] = (
+                f"{b / 1024**3:.1f}GB" if b >= 1024**3
+                else f"{b / 1024**2:.1f}MB" if b >= 1024**2
+                else f"{b / 1024:.1f}KB" if b >= 1024
+                else f"{b} bytes"
+            )
+        metadata["url"] = f"https://archive.org/details/{identifier}"
     except Exception as exc:
         logger.warning("Failed to fetch metadata for identifier=%s: %s", identifier, exc)
 
@@ -716,6 +737,27 @@ async def _ensure_cached(
         metadata["ia"] = asdict(item_meta)
         base_url = settings.base_url or ""
         metadata["jsonld"] = item_meta.to_jsonld(urn, base_url)
+        # Promote key fields to top level for MCP server compatibility
+        if item_meta.title:
+            metadata["title"] = item_meta.title
+        if item_meta.creator:
+            if isinstance(item_meta.creator, list):
+                metadata["authors"] = ", ".join(item_meta.creator)
+            else:
+                metadata["authors"] = item_meta.creator
+        if item_meta.publisher:
+            metadata["publisher"] = item_meta.publisher
+        if item_meta.language:
+            metadata["language"] = item_meta.language
+        if item_meta.item_size:
+            b = item_meta.item_size
+            metadata["size"] = (
+                f"{b / 1024**3:.1f}GB" if b >= 1024**3
+                else f"{b / 1024**2:.1f}MB" if b >= 1024**2
+                else f"{b / 1024:.1f}KB" if b >= 1024
+                else f"{b} bytes"
+            )
+        metadata["url"] = f"https://archive.org/details/{identifier}"
     except Exception as exc:
         logger.warning("Failed to fetch metadata in _ensure_cached for identifier=%s: %s", identifier, exc)
 
@@ -899,6 +941,43 @@ async def get_item_info(
         raise error_response(429, "quota_exceeded", str(exc), urn=urn)
     except IAClientError as exc:
         raise error_response(502, "upstream_error", str(exc), urn=urn)
+
+    # Update S3 metadata if item is already cached (backfill rich metadata)
+    if _s3_storage is not None:
+        import json
+        from dataclasses import asdict
+
+        meta_key = _s3_storage.meta_key(identifier)
+        try:
+            existing = json.loads(_s3_storage.download(meta_key))
+        except Exception:
+            existing = None
+
+        if existing is not None:
+            existing["ia"] = asdict(meta)
+            base_url = get_cached_settings().base_url or ""
+            existing["jsonld"] = meta.to_jsonld(urn, base_url)
+            if meta.title:
+                existing["title"] = meta.title
+            if meta.creator:
+                if isinstance(meta.creator, list):
+                    existing["authors"] = ", ".join(meta.creator)
+                else:
+                    existing["authors"] = meta.creator
+            if meta.publisher:
+                existing["publisher"] = meta.publisher
+            if meta.language:
+                existing["language"] = meta.language
+            if meta.item_size:
+                b = meta.item_size
+                existing["size"] = (
+                    f"{b / 1024**3:.1f}GB" if b >= 1024**3
+                    else f"{b / 1024**2:.1f}MB" if b >= 1024**2
+                    else f"{b / 1024:.1f}KB" if b >= 1024
+                    else f"{b} bytes"
+                )
+            existing["url"] = f"https://archive.org/details/{identifier}"
+            _s3_storage.upload(meta_key, json.dumps(existing).encode(), "application/json")
 
     # Return JSON-LD format if requested
     if format.lower() == "jsonld":
