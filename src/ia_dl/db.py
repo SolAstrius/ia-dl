@@ -151,18 +151,18 @@ INSERT INTO books (
     $11, $12, $13
 )
 ON CONFLICT (urn) DO UPDATE SET
-    title       = EXCLUDED.title,
-    authors     = EXCLUDED.authors,
-    language    = EXCLUDED.language,
-    format      = EXCLUDED.format,
-    year        = EXCLUDED.year,
-    publisher   = EXCLUDED.publisher,
-    description = EXCLUDED.description,
-    size_bytes  = EXCLUDED.size_bytes,
-    content_type = EXCLUDED.content_type,
+    title       = COALESCE(EXCLUDED.title, books.title),
+    authors     = COALESCE(EXCLUDED.authors, books.authors),
+    language    = COALESCE(EXCLUDED.language, books.language),
+    format      = COALESCE(EXCLUDED.format, books.format),
+    year        = COALESCE(EXCLUDED.year, books.year),
+    publisher   = COALESCE(EXCLUDED.publisher, books.publisher),
+    description = COALESCE(EXCLUDED.description, books.description),
+    size_bytes  = COALESCE(EXCLUDED.size_bytes, books.size_bytes),
+    content_type = COALESCE(EXCLUDED.content_type, books.content_type),
     cover_s3_key = COALESCE(EXCLUDED.cover_s3_key, books.cover_s3_key),
-    added_date  = EXCLUDED.added_date,
-    metadata    = EXCLUDED.metadata,
+    added_date  = COALESCE(EXCLUDED.added_date, books.added_date),
+    metadata    = COALESCE(EXCLUDED.metadata, books.metadata),
     updated_at  = now()
 """
 
