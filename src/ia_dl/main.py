@@ -983,11 +983,8 @@ async def get_item_info(
     except IAClientError as exc:
         raise error_response(502, "upstream_error", str(exc), urn=urn)
 
-    # Persist to PostgreSQL
-    if _db:
-        await _db.upsert_book(identifier, meta)
-
     # Update S3 metadata if item is already cached (backfill rich metadata)
+    already_cached = False
     if _s3_storage is not None:
         meta_key = _s3_storage.meta_key(identifier)
         try:
@@ -996,6 +993,7 @@ async def get_item_info(
             existing = None
 
         if existing is not None:
+            already_cached = True
             existing["ia"] = asdict(meta)
             base_url = get_cached_settings().base_url or ""
             existing["jsonld"] = meta.to_jsonld(urn, base_url)
@@ -1020,6 +1018,10 @@ async def get_item_info(
                 )
             existing["url"] = f"https://archive.org/details/{identifier}"
             _s3_storage.upload(meta_key, json.dumps(existing).encode(), "application/json")
+
+    # Persist to PostgreSQL only if the book is already downloaded/cached
+    if _db and already_cached:
+        await _db.upsert_book(identifier, meta)
 
     # Return JSON-LD format if requested
     if format.lower() == "jsonld":
