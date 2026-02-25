@@ -77,25 +77,66 @@ _ISO1_TO_ISO3: dict[str, str] = {
 }
 
 
+# Full English language name → ISO 639-3.
+# IA frequently uses these instead of codes (e.g. "Latin", "French", "English").
+_LANG_NAME_TO_ISO3: dict[str, str] = {
+    "afrikaans": "afr", "albanian": "sqi", "amharic": "amh", "arabic": "ara",
+    "armenian": "hye", "azerbaijani": "aze", "basque": "eus", "belarusian": "bel",
+    "bengali": "ben", "bosnian": "bos", "breton": "bre", "bulgarian": "bul",
+    "burmese": "mya", "catalan": "cat", "cebuano": "ceb", "cherokee": "chr",
+    "chinese": "zho", "coptic": "cop", "croatian": "hrv", "czech": "ces",
+    "danish": "dan", "dutch": "nld", "english": "eng", "esperanto": "epo",
+    "estonian": "est", "faroese": "fao", "finnish": "fin", "french": "fra",
+    "galician": "glg", "georgian": "kat", "german": "deu", "greek": "ell",
+    "gujarati": "guj", "haitian": "hat", "hausa": "hau", "hebrew": "heb",
+    "hindi": "hin", "hungarian": "hun", "icelandic": "isl", "indonesian": "ind",
+    "interlingua": "ina", "irish": "gle", "italian": "ita", "japanese": "jpn",
+    "javanese": "jav", "kannada": "kan", "kazakh": "kaz", "khmer": "khm",
+    "korean": "kor", "kurdish": "kur", "lao": "lao", "latin": "lat",
+    "latvian": "lav", "lithuanian": "lit", "luxembourgish": "ltz",
+    "macedonian": "mkd", "malay": "msa", "malayalam": "mal", "maltese": "mlt",
+    "maori": "mri", "marathi": "mar", "mongolian": "mon", "nepali": "nep",
+    "norwegian": "nor", "occitan": "oci", "oriya": "ori", "panjabi": "pan",
+    "pashto": "pus", "persian": "fas", "polish": "pol", "portuguese": "por",
+    "punjabi": "pan", "romanian": "ron", "romansh": "roh", "russian": "rus",
+    "sanskrit": "san", "scottish gaelic": "gla", "serbian": "srp", "sindhi": "snd",
+    "sinhala": "sin", "sinhalese": "sin", "slovak": "slk", "slovenian": "slv",
+    "somali": "som", "spanish": "spa", "sundanese": "sun", "swahili": "swa",
+    "swedish": "swe", "tagalog": "tgl", "tamil": "tam", "tatar": "tat",
+    "telugu": "tel", "thai": "tha", "tibetan": "bod", "tigrinya": "tir",
+    "turkish": "tur", "turkmen": "tuk", "ukrainian": "ukr", "urdu": "urd",
+    "uzbek": "uzb", "vietnamese": "vie", "welsh": "cym", "yiddish": "yid",
+    "yoruba": "yor", "zulu": "zul",
+    # Common IA variants
+    "ancient greek": "grc", "middle english": "enm", "old english": "ang",
+    "middle french": "frm", "old french": "fro", "classical greek": "grc",
+    "modern greek": "ell",
+}
+
+
 def _to_iso3(lang_str: str) -> list[str]:
     """Convert IA language string to list of ISO 639-3 codes.
 
-    IA stores language as a single string (e.g. "eng", "fre", "eng,fre")
-    or sometimes comma-separated. May use 639-2/B or 639-1 codes.
+    IA stores language as a single string (e.g. "eng", "Latin", "eng,fre")
+    or sometimes comma-separated. May use full names, 639-2/B, or 639-1 codes.
     """
     if not lang_str:
         return []
     result = []
     for code in lang_str.replace(";", ",").split(","):
-        code = code.strip().lower()
+        code = code.strip()
         if not code:
             continue
-        if len(code) == 2:
-            result.append(_ISO1_TO_ISO3.get(code, code))
-        elif len(code) == 3:
-            result.append(_ISO2B_TO_ISO3.get(code, code))  # 639-2/B → 639-3
+        lower = code.lower()
+        # Try full name first
+        if lower in _LANG_NAME_TO_ISO3:
+            result.append(_LANG_NAME_TO_ISO3[lower])
+        elif len(lower) == 2:
+            result.append(_ISO1_TO_ISO3.get(lower, lower))
+        elif len(lower) == 3:
+            result.append(_ISO2B_TO_ISO3.get(lower, lower))  # 639-2/B → 639-3
         else:
-            result.append(code)
+            result.append(lower)
     return result
 
 
