@@ -144,11 +144,11 @@ _UPSERT_BOOK = """\
 INSERT INTO books (
     urn, source, title, authors, language, format, year,
     publisher, description, size_bytes, content_type,
-    added_date, metadata
+    cover_s3_key, added_date, metadata
 ) VALUES (
     $1, 'ia', $2, $3, $4, $5,
     $6, $7, $8, $9, $10,
-    $11, $12
+    $11, $12, $13
 )
 ON CONFLICT (urn) DO UPDATE SET
     title       = EXCLUDED.title,
@@ -160,6 +160,7 @@ ON CONFLICT (urn) DO UPDATE SET
     description = EXCLUDED.description,
     size_bytes  = EXCLUDED.size_bytes,
     content_type = EXCLUDED.content_type,
+    cover_s3_key = COALESCE(EXCLUDED.cover_s3_key, books.cover_s3_key),
     added_date  = EXCLUDED.added_date,
     metadata    = EXCLUDED.metadata,
     updated_at  = now()
@@ -220,6 +221,8 @@ class Database:
         self,
         identifier: str,
         meta: ItemMetadata,
+        *,
+        cover_s3_key: str | None = None,
     ) -> None:
         """Upsert an IA item and its identifiers into PostgreSQL."""
         if not self._pool:
@@ -295,8 +298,9 @@ class Database:
             description,                            # $8
             meta.item_size or None,                 # $9
             meta.mediatype or None,                 # $10
-            added_date,                             # $11
-            json.dumps(meta_dict),                  # $12
+            cover_s3_key,                           # $11
+            added_date,                             # $12
+            json.dumps(meta_dict),                  # $13
         )
 
         try:

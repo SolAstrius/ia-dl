@@ -1067,6 +1067,86 @@ async def get_item_info(
     )
 
 
+@app.get("/urn/{id:path}/cover")
+async def resolve_cover(
+    id: str,
+) -> RedirectResponse:
+    """Resolve URN to a cover/thumbnail image for an Internet Archive item.
+
+    Returns a 302 redirect to the cover image (cached in S3 or fetched from IA).
+    IA provides thumbnails at https://archive.org/services/img/{identifier}.
+    """
+    import httpx
+
+    if _s3_storage is None:
+        raise error_response(503, "unavailable", "Service not initialized")
+
+    parsed = _parse_and_validate_urn(id)
+    identifier = parsed.identifier
+    urn = parsed.canonical()
+
+    # Check S3 cache first
+    for ext in ("jpg", "png", "webp"):
+        cover_key = _s3_storage.cover_key(identifier, ext)
+        if _s3_storage.exists(cover_key):
+            logger.info("Cover cache hit for identifier=%s", identifier)
+            url = _s3_storage.get_presigned_url(cover_key)
+            return RedirectResponse(url=url, status_code=302)
+
+    # Build list of cover URLs to try
+    cover_urls = [
+        f"https://archive.org/services/img/{identifier}",
+    ]
+
+    # Also check metadata for __ia_thumb.jpg or other cover files
+    try:
+        meta_bytes = _s3_storage.download(_s3_storage.meta_key(identifier))
+        metadata = json.loads(meta_bytes)
+        ia_meta = metadata.get("ia", {})
+        files = ia_meta.get("files", [])
+        for f in files:
+            name = f.get("name", "")
+            fmt = f.get("format", "").lower()
+            if "thumb" in name.lower() or fmt in ("jpeg thumb", "thumbnail", "jpeg"):
+                cover_urls.append(
+                    f"https://archive.org/download/{identifier}/{name}"
+                )
+    except Exception:
+        pass
+
+    # Try each URL until one works
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as http:
+        for cover_url in cover_urls:
+            try:
+                response = await http.get(cover_url)
+                if response.status_code != 200:
+                    continue
+                content = response.content
+                if len(content) < 100:
+                    continue
+
+                # Determine extension from content type
+                ct = response.headers.get("content-type", "")
+                if "png" in ct:
+                    ext = "png"
+                elif "webp" in ct:
+                    ext = "webp"
+                else:
+                    ext = "jpg"
+
+                # Cache to S3
+                cover_key = _s3_storage.cover_key(identifier, ext)
+                _s3_storage.upload(cover_key, content, ct or "image/jpeg")
+
+                url = _s3_storage.get_presigned_url(cover_key)
+                return RedirectResponse(url=url, status_code=302)
+            except Exception as exc:
+                logger.warning("Cover fetch failed for %s: %s", cover_url, exc)
+                continue
+
+    raise error_response(404, "not_found", "No cover image available", urn=urn)
+
+
 @app.get("/urn/{id:path}", response_model=I2LResponse)
 async def resolve_i2l(
     id: str,
