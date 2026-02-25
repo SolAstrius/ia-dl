@@ -6,9 +6,11 @@ caches them in S3, and returns presigned URLs.
 Designed to run with Python 3.13 free-threaded mode for true parallelism.
 """
 
+import json
 import logging
 import time
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from functools import lru_cache
 
 from fastapi import FastAPI, HTTPException, Query
@@ -25,6 +27,7 @@ from .ia_client import (
     SearchResult,
 )
 from .config import Settings, get_settings
+from .db import Database
 from .downloader import DownloadError, download_item
 from .s3 import S3Storage, content_type_for_format
 from .urn import parse_urn, to_urn, ParsedUrn, WrongResolverError, InvalidUrnError
@@ -40,6 +43,7 @@ logger = logging.getLogger(__name__)
 # Global state (initialized in lifespan)
 _ia_client: IAClient | None = None
 _s3_storage: S3Storage | None = None
+_db: Database | None = None
 
 
 @lru_cache
@@ -51,7 +55,7 @@ def get_cached_settings() -> Settings:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize and cleanup application resources."""
-    global _ia_client, _s3_storage
+    global _ia_client, _s3_storage, _db
 
     settings = get_cached_settings()
 
@@ -74,9 +78,21 @@ async def lifespan(app: FastAPI):
     _s3_storage = S3Storage.create(settings)
     logger.info("Initialized S3 storage (bucket=%s)", settings.s3_bucket)
 
+    # Initialize PostgreSQL (shared annas-mcp database, optional)
+    if settings.database_url:
+        try:
+            _db = Database(settings.database_url)
+            await _db.connect()
+        except Exception as exc:
+            logger.warning("Failed to connect to PostgreSQL: %s", exc)
+            _db = None
+
     yield
 
     # Cleanup
+    if _db:
+        await _db.close()
+
     if _ia_client:
         await _ia_client.close()
         logger.info("Closed Internet Archive client")
@@ -129,11 +145,18 @@ class BatchDownloadResponse(BaseModel):
     failed: int
 
 
+class ComponentHealth(BaseModel):
+    """Health status of a single component."""
+
+    status: str  # "ok" or "unavailable"
+
+
 class HealthResponse(BaseModel):
     """Health check response."""
 
-    status: str
+    status: str  # "ok" or "degraded"
     version: str
+    components: dict[str, ComponentHealth] = {}
 
 
 # =============================================================================
@@ -331,9 +354,25 @@ def error_response(status_code: int, error: str, detail: str, urn: str | None = 
 
 
 @app.get("/health", response_model=HealthResponse)
+@app.get("/healthz", response_model=HealthResponse, include_in_schema=False)
 async def health_check() -> HealthResponse:
-    """Health check endpoint."""
-    return HealthResponse(status="ok", version="0.1.0")
+    """Health check endpoint with component-level status."""
+    components: dict[str, ComponentHealth] = {}
+
+    s3_ok = _s3_storage is not None
+    components["s3"] = ComponentHealth(status="ok" if s3_ok else "unavailable")
+
+    if _db is not None:
+        db_ok = await _db.ping()
+        components["db"] = ComponentHealth(status="ok" if db_ok else "unavailable")
+
+    degraded = any(c.status != "ok" for c in components.values())
+
+    return HealthResponse(
+        status="degraded" if degraded else "ok",
+        version="0.1.0",
+        components=components,
+    )
 
 
 @app.get("/search", response_model=SearchResponse, tags=["Search"])
@@ -530,7 +569,6 @@ async def download_item_endpoint(
             # Try to get title from metadata
             title = ""
             try:
-                import json
                 meta_bytes = _s3_storage.download(_s3_storage.meta_key(identifier))
                 cached_metadata = json.loads(meta_bytes)
                 title = cached_metadata.get("title", "")
@@ -574,9 +612,6 @@ async def download_item_endpoint(
     _s3_storage.upload(actual_key, result.content, result.content_type)
 
     # Fetch and store metadata
-    import json
-    from dataclasses import asdict
-
     metadata = {
         "identifier": identifier,
         "filename": result.filename,
@@ -586,6 +621,7 @@ async def download_item_endpoint(
     }
 
     # Try to fetch rich metadata from Internet Archive
+    item_meta: ItemMetadata | None = None
     try:
         item_meta = await _ia_client.fetch_metadata(identifier)
         metadata["title"] = item_meta.title
@@ -618,6 +654,10 @@ async def download_item_endpoint(
         logger.warning("Failed to fetch metadata for identifier=%s: %s", identifier, exc)
 
     _s3_storage.upload(meta_key, json.dumps(metadata).encode(), "application/json")
+
+    # Persist to PostgreSQL
+    if _db and item_meta:
+        await _db.upsert_book(identifier, item_meta)
 
     # Generate presigned URL
     url = _s3_storage.get_presigned_url(actual_key, result.filename)
@@ -679,9 +719,6 @@ async def _ensure_cached(
 
     Returns (filename, format) of cached file.
     """
-    import json
-    from dataclasses import asdict
-
     if _ia_client is None or _s3_storage is None:
         raise error_response(503, "unavailable", "Service not initialized")
 
@@ -731,6 +768,7 @@ async def _ensure_cached(
         "size_bytes": result.size_bytes,
     }
 
+    item_meta: ItemMetadata | None = None
     try:
         item_meta = await _ia_client.fetch_metadata(identifier)
         metadata["title"] = item_meta.title
@@ -762,6 +800,10 @@ async def _ensure_cached(
         logger.warning("Failed to fetch metadata in _ensure_cached for identifier=%s: %s", identifier, exc)
 
     _s3_storage.upload(_s3_storage.meta_key(identifier), json.dumps(metadata).encode(), "application/json")
+
+    # Persist to PostgreSQL
+    if _db and item_meta:
+        await _db.upsert_book(identifier, item_meta)
 
     return result.filename, result.format
 
@@ -859,7 +901,6 @@ async def resolve_i2c(
     - URN r-component: urn:ia:item?+format=epub (RFC 8141)
     - Query param: ?format=epub (fallback)
     """
-    import json
 
     if _s3_storage is None:
         raise error_response(503, "unavailable", "Service not initialized")
@@ -942,11 +983,12 @@ async def get_item_info(
     except IAClientError as exc:
         raise error_response(502, "upstream_error", str(exc), urn=urn)
 
+    # Persist to PostgreSQL
+    if _db:
+        await _db.upsert_book(identifier, meta)
+
     # Update S3 metadata if item is already cached (backfill rich metadata)
     if _s3_storage is not None:
-        import json
-        from dataclasses import asdict
-
         meta_key = _s3_storage.meta_key(identifier)
         try:
             existing = json.loads(_s3_storage.download(meta_key))

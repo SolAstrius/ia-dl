@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     # Public base URL for generating external links (e.g., https://dl.example.com)
     base_url: str | None = None
 
+    # PostgreSQL (shared annas-mcp database, optional)
+    database_url: str | None = None
+
     model_config = {"env_prefix": "IA_DL_", "env_file": ".env", "extra": "ignore"}
 
 
