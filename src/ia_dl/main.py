@@ -6,6 +6,7 @@ caches them in S3, and returns presigned URLs.
 Designed to run with Python 3.13 free-threaded mode for true parallelism.
 """
 
+import asyncio
 import json
 import logging
 import time
@@ -350,6 +351,31 @@ def error_response(status_code: int, error: str, detail: str, urn: str | None = 
     )
 
 
+# Background enrichment
+
+
+async def _enrich_if_needed(identifier: str) -> None:
+    """Backfill PG metadata for a cache-hit item if row is missing or incomplete."""
+    urn = f"urn:ia:{identifier}"
+    try:
+        pool = _db._pool  # type: ignore[union-attr]
+        if pool is None:
+            return
+
+        row = await pool.fetchrow("SELECT description FROM books WHERE urn = $1", urn)
+        needs_enrich = row is None or row["description"] is None
+
+        if not needs_enrich:
+            return
+
+        item_meta = await _ia_client.fetch_metadata(identifier)  # type: ignore[union-attr]
+        await _db.upsert_book(identifier, item_meta)  # type: ignore[union-attr]
+        logger.info("Enriched metadata for %s: %s", urn, item_meta.title)
+
+    except Exception:
+        logger.debug("Background enrichment failed for %s", urn, exc_info=True)
+
+
 # Endpoints
 
 
@@ -576,6 +602,11 @@ async def download_item_endpoint(
                 pass
 
             url = _s3_storage.get_presigned_url(book_key, filename)
+
+            # Fire-and-forget: enrich PG metadata if row is missing or incomplete
+            if _db and _ia_client:
+                asyncio.create_task(_enrich_if_needed(identifier))
+
             return DownloadResponse(
                 id=urn,
                 identifier=identifier,
